@@ -3,19 +3,23 @@ use std::time::Duration;
 
 use eyre::Result;
 use matrix_sdk::config::SyncSettings;
-use matrix_sdk::event_handler::RawEvent;
+use matrix_sdk::event_handler::{Ctx, RawEvent};
 use matrix_sdk::room::Receipts;
 use matrix_sdk::ruma::OwnedEventId;
+use matrix_sdk::ruma::UInt;
 use matrix_sdk::ruma::api::client::filter::FilterDefinition;
 use matrix_sdk::ruma::events::relation::{InReplyTo, Thread};
 use matrix_sdk::ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent;
 use matrix_sdk::ruma::events::room::member::{
     MembershipState, StrippedRoomMemberEvent, SyncRoomMemberEvent,
 };
+#[cfg(not(any(feature = "allow-looping", feature = "unstable-msc4295")))]
+use matrix_sdk::ruma::events::room::message::NoticeMessageEventContent;
 use matrix_sdk::ruma::events::room::message::{
-    MessageType, NoticeMessageEventContent, OriginalSyncRoomMessageEvent, Relation,
+    MessageType, OriginalSyncRoomMessageEvent, Relation,
 };
 use matrix_sdk::ruma::events::sticker::OriginalSyncStickerEvent;
+use matrix_sdk::ruma::uint;
 use matrix_sdk::{Client, Room, RoomState};
 use tracing::{Instrument, error, info, instrument, warn};
 use tracing_subscriber::{EnvFilter, prelude::*};
@@ -52,6 +56,14 @@ enum Command {
             help = "Path to an existing Matrix session"
         )]
         data_dir: PathBuf,
+        #[cfg(feature = "unstable-msc4295")]
+        #[clap(
+            long = "max_bounce_limit",
+            value_name = "MAX_BOUNCE_LIMIT",
+            default_value = "0",
+            help = "Maximum MSC4295 bounce limit"
+        )]
+        max_bounce_limit: UInt,
     },
     #[clap(about = "Log out of the Matrix session, and delete the state database")]
     Logout {
@@ -62,6 +74,12 @@ enum Command {
         )]
         data_dir: PathBuf,
     },
+}
+
+#[derive(Clone, Copy)]
+struct Params {
+    #[allow(dead_code)]
+    max_bounce_limit: UInt,
 }
 
 #[tokio::main]
@@ -97,13 +115,27 @@ async fn main() -> Result<()> {
             data_dir,
             device_name,
         } => drop(matrixbot_ezlogin::setup_interactive(&data_dir, &device_name).await?),
-        Command::Run { data_dir } => run(&data_dir).await?,
+        #[cfg(feature = "unstable-msc4295")]
+        Command::Run {
+            data_dir,
+            max_bounce_limit,
+        } => run(&data_dir, Params { max_bounce_limit }).await?,
+        #[cfg(not(feature = "unstable-msc4295"))]
+        Command::Run { data_dir } => {
+            run(
+                &data_dir,
+                Params {
+                    max_bounce_limit: uint!(0),
+                },
+            )
+            .await?
+        }
         Command::Logout { data_dir } => matrixbot_ezlogin::logout(&data_dir).await?,
     };
     Ok(())
 }
 
-async fn run(data_dir: &Path) -> Result<()> {
+async fn run(data_dir: &Path, params: Params) -> Result<()> {
     let (client, sync_helper) = matrixbot_ezlogin::login(data_dir).await?;
 
     // Enable event cache to remember old messages.
@@ -129,6 +161,7 @@ async fn run(data_dir: &Path) -> Result<()> {
         .sync_once(&client, sync_settings.clone())
         .await?;
 
+    client.add_event_handler_context(params);
     client.add_event_handler(on_message);
     client.add_event_handler(on_sticker);
     client.add_event_handler(on_utd);
@@ -175,7 +208,12 @@ async fn set_read_marker(room: Room, event_id: OwnedEventId) {
 
 // https://spec.matrix.org/v1.14/client-server-api/#mroommessage
 #[instrument(skip_all)]
-async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, client: Client) {
+async fn on_message(
+    event: OriginalSyncRoomMessageEvent,
+    room: Room,
+    client: Client,
+    #[allow(unused_variables)] params: Ctx<Params>,
+) {
     if event.sender == client.user_id().unwrap() {
         // Ignore my own message
         return;
@@ -193,7 +231,34 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, client: Cli
     if let Some(Relation::Replacement(_)) = event.content.relates_to {
         return;
     }
-    if !matches!(
+
+    #[cfg(feature = "unstable-msc4295")]
+    let incoming_bounce_limit = event.content.bounce_limit;
+    #[cfg(feature = "unstable-msc4295")]
+    if incoming_bounce_limit == Some(uint!(0)) {
+        info!(
+            "Ignoring room {}, event {}: bounce_limit = 0.",
+            room.room_id(),
+            event.event_id
+        );
+        return;
+    }
+
+    // Check message type.
+    #[cfg(feature = "unstable-msc4295")]
+    let is_acceptable_msgtype = matches!(
+        event.content.msgtype,
+        MessageType::Audio(_)
+            | MessageType::Emote(_)
+            | MessageType::File(_)
+            | MessageType::Image(_)
+            | MessageType::Location(_)
+            | MessageType::Notice(_)
+            | MessageType::Text(_)
+            | MessageType::Video(_)
+    );
+    #[cfg(not(feature = "unstable-msc4295"))]
+    let is_acceptable_msgtype = matches!(
         event.content.msgtype,
         MessageType::Audio(_)
             | MessageType::Emote(_)
@@ -202,7 +267,9 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, client: Cli
             | MessageType::Location(_)
             | MessageType::Text(_)
             | MessageType::Video(_)
-    ) {
+    );
+
+    if !is_acceptable_msgtype {
         info!(
             "Ignoring room {}, event {}: Message type is {}.",
             room.room_id(),
@@ -212,7 +279,19 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, client: Cli
         return;
     }
 
+    #[cfg(feature = "unstable-msc4295")]
+    if incoming_bounce_limit.is_none() && matches!(event.content.msgtype, MessageType::Notice(_)) {
+        info!(
+            "Ignoring room {}, event {}: m.notice without bounce_limit.",
+            room.room_id(),
+            event.event_id
+        );
+        return;
+    }
+
     let mut reply = event.content;
+
+    #[cfg(not(any(feature = "allow-looping", feature = "unstable-msc4295")))]
     // Transform m.text into m.notice. Some bot implementations are designed to ignore m.notice, preventing infinite looping.
     // Note that some clients may choose to render m.notice in a different text color.
     if let MessageType::Text(text) = reply.msgtype {
@@ -220,6 +299,7 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, client: Cli
         notice.formatted = text.formatted;
         reply.msgtype = MessageType::Notice(notice);
     }
+
     // We should use make_reply_to, but it embeds the original message body, which I don't want
     reply.relates_to = match reply.relates_to {
         Some(Relation::Replacement(_)) => unreachable!(),
@@ -231,6 +311,14 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, client: Cli
             in_reply_to: InReplyTo::new(event.event_id.to_owned()),
         }),
     };
+
+    #[cfg(feature = "unstable-msc4295")]
+    {
+        let outgoing_bounce_limit = incoming_bounce_limit.map_or(params.max_bounce_limit, |x| {
+            x.saturating_sub(uint!(1)).min(params.max_bounce_limit)
+        });
+        reply.bounce_limit = Some(outgoing_bounce_limit);
+    }
 
     tokio::spawn(
         async move {
@@ -262,7 +350,12 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, client: Cli
 //
 // https://spec.matrix.org/v1.14/client-server-api/#sticker-messages
 #[instrument(skip_all)]
-async fn on_sticker(event: OriginalSyncStickerEvent, room: Room, client: Client) {
+async fn on_sticker(
+    event: OriginalSyncStickerEvent,
+    room: Room,
+    client: Client,
+    #[allow(unused_variables)] params: Ctx<Params>,
+) {
     if event.sender == client.user_id().unwrap() {
         // Ignore my own message
         return;
@@ -281,6 +374,18 @@ async fn on_sticker(event: OriginalSyncStickerEvent, room: Room, client: Client)
         return;
     }
 
+    #[cfg(feature = "unstable-msc4295")]
+    let incoming_bounce_limit = event.content.bounce_limit;
+    #[cfg(feature = "unstable-msc4295")]
+    if incoming_bounce_limit == Some(uint!(0)) {
+        info!(
+            "Ignoring room {}, event {}: bounce_limit = 0.",
+            room.room_id(),
+            event.event_id
+        );
+        return;
+    }
+
     let mut reply = event.content;
     // We should use make_reply_to, but it embeds the original message body, which I don't want
     reply.relates_to = match reply.relates_to {
@@ -293,6 +398,14 @@ async fn on_sticker(event: OriginalSyncStickerEvent, room: Room, client: Client)
             in_reply_to: InReplyTo::new(event.event_id.to_owned()),
         }),
     };
+
+    #[cfg(feature = "unstable-msc4295")]
+    {
+        let outgoing_bounce_limit = incoming_bounce_limit.map_or(params.max_bounce_limit, |x| {
+            x.saturating_sub(uint!(1)).min(params.max_bounce_limit)
+        });
+        reply.bounce_limit = Some(outgoing_bounce_limit);
+    }
 
     tokio::spawn(
         async move {
@@ -361,31 +474,31 @@ async fn on_invite(event: StrippedRoomMemberEvent, room: Room, client: Client) {
         );
         return;
     }
-    if !room.is_direct().await.unwrap_or(false) {
-        info!(
-            "Rejecting invitation from {} to room {}: Room is not a direct chat.",
-            event.sender,
-            room.room_id()
-        );
-        tokio::spawn(
-            async move {
-                match room.leave().await {
-                    Ok(_) => {
-                        info!("Rejected room {}.", room.room_id());
-                    }
-                    Err(err) => {
-                        error!(
-                            "Failed to reject room invitation {}: {}",
-                            room.room_id(),
-                            err
-                        );
-                    }
-                }
-            }
-            .in_current_span(),
-        );
-        return;
-    }
+    // if !room.is_direct().await.unwrap_or(false) {
+    //     info!(
+    //         "Rejecting invitation from {} to room {}: Room is not a direct chat.",
+    //         event.sender,
+    //         room.room_id()
+    //     );
+    //     tokio::spawn(
+    //         async move {
+    //             match room.leave().await {
+    //                 Ok(_) => {
+    //                     info!("Rejected room {}.", room.room_id());
+    //                 }
+    //                 Err(err) => {
+    //                     error!(
+    //                         "Failed to reject room invitation {}: {}",
+    //                         room.room_id(),
+    //                         err
+    //                     );
+    //                 }
+    //             }
+    //         }
+    //         .in_current_span(),
+    //     );
+    //     return;
+    // }
     info!(
         "Accepting invitation from {} to room {}.",
         event.sender,

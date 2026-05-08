@@ -1,0 +1,8 @@
+[submodule "vendor/ruma"]
+	path = vendor/ruma
+	url = https://github.com/m13253/ruma-msc4295.git
+	branch = bounce-limit-msc4295
+[submodule "vendor/matrix-rust-sdk"]
+	path = vendor/matrix-rust-sdk
+	url = https://github.com/m13253/matrix-rust-sdk-msc4295.git
+	branch = bounce-limit-msc4295
